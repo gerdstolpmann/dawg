@@ -1,3 +1,21 @@
+(* GS. Finding bins by analyzing frequencies. The algorithm first creates
+   b bins in a trivial way, then adds more elements one by one, and in every
+   step two adjacent bins are merged, so that we have before the step and 
+   after the step exactly b bins.
+
+   Which bins are merged? The two bins with the lowest combined counts.
+   This is analogous to Huffman coding, where in one step the nodes with the
+   lowest weights are combined into a bit.
+
+   By design, this works only well if there are initial counts. If all counts are
+   just 1 (which can easily happen for inputs coming from real measurements)
+   the algorithm just pairs up k adjacent elements into a single one. (I guess
+   in that case we'd better off with a compressor that also takes the value
+   differences into account - bins closely together are more likely to paired
+   up than those lying far away from each other.)
+ *)
+
+
 type bin = {
   left: float;
   mean: float;
@@ -51,6 +69,9 @@ let huf_one b_plus_one =
 let singleton x =
   { left = x; mean = x; right = x }
 
+(* GS. Better done with two passes, one extracting the n first elements, and
+   one skipping the n first elements. Doesn't stress the GC as much.
+ *)
 let list_split_n n l =
   let rec iter n prefix tail = match tail with
     | _ when n <= 0 -> prefix, tail
@@ -58,6 +79,11 @@ let list_split_n n l =
     | hd :: tl -> iter (pred n) (hd :: prefix) tl
   in
   iter n [] l
+
+(* GS:
+    b = number of bins
+    elem_counts = list of (value,count), sorted by descending values
+ *)
 
 let create elem_counts b =
   let b_elems, more_elems = list_split_n b elem_counts in

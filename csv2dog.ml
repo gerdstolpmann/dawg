@@ -5,6 +5,46 @@ open Dog_t
 
 module List = Utils.List
 
+(* GS: digestion is done in two passes. First, the csv files are parsed and
+   the cells are rearranged, and written into N work files. In the second
+   pass, the N work files are merged while they are read back from disk,
+   and postprocessed column by column (the data of a column appears now
+   consecutively in the merged stream - the sort/merge pass transposes the
+   data implicitly).
+
+   Details of first pass: The parser reads the configured max number of cells,
+   and sorts these first by column, then by content. These slices are then
+   written to work files, i.e. work file k contains
+
+   <column1> <column2> ... <columnN>
+
+   and every <columnJ> contains the cells sorts by value. The file format is
+   completely overengineered at this point - on the one hand, the type of
+   four cells are merged as bit patterns into a single byte, but on the other
+   hand obvious compressions are not done, like a delta encoding of row and
+   column numbers. My thinking is that the use of Biniou is useless here -
+   marshalling the array of cells to disk would have been fine.
+
+   Details of second pass: The postprocessing depends on whether there are
+   only strings ("categorical" feature) or only numbers ("ordinal" feature).
+   For a categorical feature the column is represented as a list of
+   (i, cat) where i is the row number and cat the category ID. This list
+   is sorted by i (and compressed with RLE). The category IDs are assigned
+   so that the categories with the most rows have lowest IDs.
+
+   Ordinal features are mapped to categorical features in some sense. For that
+   all values appearing in a column are put into bins, and the column is then
+   represented as list of (i, bin) where i is the row number and bin is the
+   bin number. The bins are given by an array breakpoints [b0;...;bN], and
+   bin j consists of the values b(j)..b(j+1). Unlike categorical features,
+   the column list (i,bin) is sorted by bin values and not by count.
+
+   Ordinal features usually produce float-valued bins. Only if the inputs are
+   all ints and are below some limit, the bins are int-values (and every
+   bin contains only one value).
+ *)
+
+
 
 let index =
   let rec loop i map = function
@@ -22,6 +62,9 @@ type cell = int * int * Csv_types.value
 (* order by feature_id [j_*] in ascending order, then by observation
    in ascending order *)
 let compare_cells (j_1, value_1, _) (j_2, value_2, _) =
+  (* GS: I consider this as a bug. There is no guarantee that [compare] only
+     returns {-1,0,1}.
+   *)
   match Pervasives.compare j_1 j_2 with
     | -1 -> -1
     |  1 ->  1
@@ -73,6 +116,8 @@ let write_cells_to_file work_dir file_num cells =
   Bi_outbuf.flush_channel_writer bobuf;
   close_out ouch
 
+
+(* GS. Get the (j,i,value) tuples from one of the work files *)
 let cell_stream path =
   let inch = open_in path in
   let bibuf = Bi_inbuf.from_channel inch in
@@ -144,6 +189,7 @@ let dummy_cell = (-1, -1, `Float nan)
    f := file index
 *)
 
+(** GS. this implements pass 1 *)
 let write_cells_to_work_dir work_dir header next_row config =
   let num_features = List.length header in
 
@@ -253,6 +299,9 @@ let csv_to_cells work_dir config =
     | _ ->
       print_endline "syntax error"; exit 1
 
+(* GS. This functor provides a function [create] that merges N streams by the
+   [leq] function. We get a single stream that is first sorted by column, then
+   by value *)
 module CellMerge = Stream_merge.Make(
     struct
       type t = cell
@@ -316,6 +365,13 @@ let rec exclude_none accu = function
 let exclude_none list =
   exclude_none [] list
 
+(* GS: categorical_feature is only called when the column only has strings.
+   j = column
+   n = number rows
+   kc = counts per type (int/float/string)
+   hist = column histogram
+   i_values = list of (i,value) where i=row number
+ *)
 let categorical_feature j kc hist n i_values feature_id_to_name config =
   let n_anonymous = n - kc.n_string in
   assert (n_anonymous >= 0);
@@ -332,10 +388,12 @@ let categorical_feature j kc hist n i_values feature_id_to_name config =
         let category_to_count = (s_value, count) :: category_to_count in
         category_to_count, num_categories + 1
     ) hist ([], 0) in
+  (* GS: num_categories = Hashtbl.length hist *)
+  (* GS: category_to_count: list of (string, freq), unsorted *)
 
   if n_anonymous = 0 then
     if num_categories = 1 then
-      `Uniform
+      `Uniform (* GS: always the same value in column => `Boring *)
     else (
       (* sort so that categories with lower counts first *)
       let category_to_count = List.sort (
@@ -346,6 +404,8 @@ let categorical_feature j kc hist n i_values feature_id_to_name config =
       (* categories with higher counts are first *)
       let categories = List.rev_map fst category_to_count in
 
+      (* GS. Number the categories from 0..num-1, and cat_to_cat_id maps
+         the string to the number *)
       let cat_to_cat_id = Hashtbl.create num_categories in
       List.iteri (
         fun cat_id cat ->
@@ -362,6 +422,15 @@ let categorical_feature j kc hist n i_values feature_id_to_name config =
 
       let cat_runs = Rle.encode_sparse n i_cats (-1) in
       let c_vector = `RLE cat_runs in
+
+      (* GS. A categorical feature is just a sequence of (row_num,cat_id)
+         pairs, in row_num order. cat_ids are assigned so that highest-freq
+         categories have lowest IDs.
+
+         This format limits the possible operations drastically. Basically
+         everything needs a linear pass over the whole column vector. Even
+         for trivial things like: get all rows for a certain category.
+       *)
 
       let cat = `Cat {
           c_feature_id = j;
@@ -382,6 +451,8 @@ let categorical_feature j kc hist n i_values feature_id_to_name config =
 
     (* add anonymous category count *)
     let category_to_count = (None, n_anonymous) :: category_to_count in
+    (* GS. None is handled here as if it were just another value, but distinct
+       from all other values *)
 
     (* sort so that categories with lower counts first *)
     let category_to_count = List.sort (
@@ -505,6 +576,7 @@ let unbox_listify_distinct_value_to_count of_value distinct_value_to_count_tbl =
       ((v, count) :: accu, num_distinct_values + 1)
   ) distinct_value_to_count_tbl ([], 0)
 
+(* GS the tail of both float vectors and int vectors *)
 let ordinal_feature
     zero
     of_value
@@ -526,6 +598,11 @@ let ordinal_feature
   let zero_rank = find (of_value zero) in
   let rank_runs = Rle.encode_sparse n i_rank zero_rank in
   let o_vector = `RLE rank_runs in
+  (* GS:
+     ordinal features are actually pressed into categories. The breakpoints
+     specify the categories. If a value is in the interval b(i)..b(i+1) this
+     is considered as category i.
+   *)
   let ord = `Ord {
       o_feature_id = j;
       o_feature_name_opt = feature_id_to_name j;
@@ -543,12 +620,14 @@ let float_or_int_feature
     i_values
     feature_id_to_name
     ~max_width =
+  (* GS. max_width is a config, something like number of bits *)
 
   let n_anonymous = n - kc.n_int - kc.n_float in
   assert (n_anonymous >= 0);
 
   if kc.n_float > 0 then (
     (* this is a float feature *)
+    (* GS. any ints are converted to floats *)
 
     (* augment the histogram with zero's, assuming this is the anonymous
        value *)
@@ -572,12 +651,16 @@ let float_or_int_feature
     if num_distinct_values = 1 then
       `Uniform
     else
-      let uncapped_width = Utils.width num_distinct_values in
+      let uncapped_width = Utils.width num_distinct_values in  (* GS: approx log2 *)
       let breakpoints =
         if uncapped_width <= max_width then
+          (* GS. the sorted values *)
           List.map fst (sort_fst_ascending hist_list)
         else
           (* cap the width through down-sampling *)
+          (* GS. a list of boundary values [b1; b2; ...; bN] so that the
+             observed values fall into one of the "bins" b(i)..b(i+1)
+           *)
           let num_bins = 1 lsl max_width in
           let hist = sort_fst_descending hist_list in
           downsample_hist hist num_bins
@@ -657,12 +740,17 @@ let mixed_type_feature_exn mt_feature_id mt_feature_name i_values =
   } in
   raise (MixedTypeFeature mt)
 
+(* GS:
+   j = column
+   n = number rows
+ *)
 let write_feature j i_values n dog feature_id_to_name config =
+  (* GS. Create histogram for whole column *)
   let hist = Hashtbl.create (n / 100) in
   let kc = List.fold_left (
       fun kc (i, value) ->
-        incr hist value;
-        match value with
+        incr hist value;   (* GS. incr is defined above... not Pervasives.incr *)
+        match value with   (* GS. heavy stress for the garbage collector *)
           | `Float _  -> { kc with n_float  = kc.n_float  + 1 }
           | `Int _    -> { kc with n_int    = kc.n_int    + 1 }
           | `String _ -> { kc with n_string = kc.n_string + 1 }
@@ -673,7 +761,7 @@ let write_feature j i_values n dog feature_id_to_name config =
       let cf = categorical_feature j kc hist n i_values
           feature_id_to_name config in
       match cf with
-        | `Uniform ->
+        | `Uniform ->  (* GS: `Boring columns are omitted. They do not contain information *)
           Printf.printf "%d: cat uniform\n%!" j
 
         | `NonUniform cat ->
@@ -723,6 +811,8 @@ let pr_hist j i_values =
   ) {n_float=0; n_int=0; n_string=0} i_values in
   printf "%d: f=%d i=%d s=%d\n" j kc.n_float kc.n_int kc.n_string
 
+
+(* GS. This implements pass 2 *)
 let read_cells_write_features work_dir ~num_cell_files ~num_rows header config =
   let feature_id_to_name =
     let idx = index header in
@@ -730,6 +820,9 @@ let read_cells_write_features work_dir ~num_cell_files ~num_rows header config =
       Utils.IntMap.find_opt feature_id idx
   in
 
+  (* GS. Gather up the values for a single column (which is completely in RAM
+     then), and call write_feature for postprocessing and addition to dog 
+     file *)
   let rec loop prev_j i_values dog =
     parser
   | [< '(j, i, value); tail >] ->
@@ -752,6 +845,9 @@ let read_cells_write_features work_dir ~num_cell_files ~num_rows header config =
 
   (* merge all the files to which cells were written in feature id,
      then (reverse) row id order *)
+  (* GS: the fold var file_num covers the range 0..num_cell_files-1 *)
+  (* GS: Per work file we keep one file descriptor conituously open. This
+     limits the size of the input *)
   let cell_streams = Utils.fold_range (
       fun file_num accu ->
         let cell_path = Filename.concat work_dir (string_of_int file_num) in

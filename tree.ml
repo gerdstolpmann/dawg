@@ -3,9 +3,16 @@ open Model_t
 
 type feature_monotonicity_map = Dog_t.monotonicity Utils.IntMap.t
 
+(* GS. in_subset is the array of bools selecting the currently examined
+   subset of rows. We want two subsets of in_subset: in_subset_left with the
+   rows left of the split point, and in_subset_right with those on the right
+ *)
 let partition_observations in_subset splitting_feature best_split =
   let in_subset_left  = Array.copy in_subset in
   let in_subset_right = Array.copy in_subset in
+  (* GS. the array length is N = number of rows. Copying that could be
+     expensive.
+   *)
 
   (match splitting_feature, best_split with
     | `Ord { Dog_t.o_vector; o_cardinality },
@@ -32,10 +39,22 @@ let partition_observations in_subset splitting_feature best_split =
                 done
             );
       )
+      (* GS. For ordinal features, the loop typically goes over the whole
+         range of rows. That's bad. A good data structure would limit this
+         somehow, so that we could compute
+           in_subset_left = in_subset ISECT { x | x <= os_split }
+         faster. Think about pre-bucketizing ordinal features.
+       *)
 
     | `Cat { Dog_t.c_vector; c_cardinality },
       `CategoricalSplit ({ os_split }, s_to_k) -> (
         assert (Array.length s_to_k = c_cardinality);
+
+        (* GS. The categories k=0,...,card-1 are permuted by s (this permutation
+           is created so that the categories are sorted by a value, the
+           "pseudo response"). s_to_k contains the k for every s. Because it is
+           a permutation we can reverse it.
+         *)
 
         (* create reverse mapping *)
         let s_by_k = Array.make c_cardinality (-1) in
@@ -67,12 +86,19 @@ let partition_observations in_subset splitting_feature best_split =
                     in_subset_right.(i) <- not in_left
                 done
             );
+
+         (* GS Speed of that could be drastically improved by a real set
+            representation. We only need to iterate over the partitioning
+            of in_subset by the categories.
+          *)
+
       )
 
     | _ -> assert false
   );
   in_subset_left, in_subset_right
 
+(* GS. State for the tree creator. [splitter] is mutable inside *)
 type m = {
   max_depth : int;
   feature_map : Feat_map.t;
@@ -83,6 +109,9 @@ type m = {
 let string_of_split { s_gamma ; s_n ; s_loss } =
   Printf.sprintf "gamma=%f n=%d loss=%f" s_gamma s_n s_loss
 
+(* GS. The outer loop for choosing the best split: try the features in turn.
+   For every feature try to find a best split (which is not always possible).
+ *)
 let best_split_of_features m =
   Feat_map.fold m.feature_map (
     fun feature best_opt ->
@@ -158,6 +187,7 @@ let rec terminate (best_split : Proto_t.split) =
     in
     Some node
 
+(* GS. Actually, [make] is the entry *)
 and make m depth in_subset =
   m.splitter#update_with_subset in_subset;
   match best_split_of_features m with
@@ -195,6 +225,8 @@ and make m depth in_subset =
           match split with
             | `CategoricalSplit (os, s_to_k) ->
               let directions = directions_of_split s_to_k os.os_split in
+              (* GS the directions are an array mapping categories to
+                 `Left/`Right *)
               `CategoricalNode {
                 cn_feature_id = os.os_feature_id;
                 cn_category_directions = directions;
@@ -265,6 +297,22 @@ let is_leaf = function
   | `Leaf _ -> true
   | _ -> false
 
+(* GS. [trees] is an array of partially evaluated trees. [trees.(k)] is
+   to some degree evaluated for row k. This function updates [trees] by
+   evaluating additionally [feature_id]. The trees are then specialized,
+   i.e. a simpler tree is created for the knowledge that the feature has
+   a certain value for the row. When the tree is fully evaluated it is
+   just a leaf. We count the leaves we have so far (if it reaches
+   [Array.length trees] we are done).
+ *)
+(* GS. The idea of iterating the features in the outer loop and evaluating
+   the trees partially is only attractive here because we don't have a
+   good way of randomly accessing the features. It's quite RAM-intensive,
+   and probably eats all RAM that got free by feature compression... It
+   would be better to provide random access and evaluate the same tree
+   multiple times.
+ *)
+
 let eval_partially trees cardinality feature_id = function
   | `Dense v ->
     let width_num_bytes = Utils.num_bytes cardinality in
@@ -323,6 +371,10 @@ let feature_id_set_of_tree tree =
     ) 0 tree_array
 *)
 
+(* GS. let loss = mk_eval num_observations get_afeature tree
+
+   Applies a tree to a whole vector of observations.
+ *)
 let mk_eval num_observations =
   let gamma = Array.make num_observations nan in
   let gamma_leaf = Array.make num_observations (`Leaf nan) in
@@ -357,6 +409,7 @@ let mk_eval num_observations =
     gamma
 
 
+(* GS. Multiply the leaf values by a factor alpha *)
 let rec shrink alpha = function
   | `Leaf gamma ->  `Leaf (alpha *. gamma)
 

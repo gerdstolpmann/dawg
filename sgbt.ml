@@ -38,6 +38,7 @@ type t = {
   (* how do we evaluate a tree over all the observations in the
      training set? *)
   eval : (Dog_t.feature_id -> Feat.afeature) -> Model_t.l_tree -> float array;
+  (* GS. NB afeature is the encoded feature as read from disk, using Vec.t *)
 
   (* how do we create random paritions of the training set (and
      subsets thereof) ? *)
@@ -99,7 +100,7 @@ let rec learn_with_fold_rate conf t iteration =
     Tree.max_depth = conf.max_depth;
     feature_map = t.feature_map;
     feature_monotonicity_map;
-    splitter = t.splitter
+    splitter = t.splitter       (* GS. Warning: the splitter is imperative *)
   } in
 
   (* draw a random subset of this fold *)
@@ -110,12 +111,18 @@ let rec learn_with_fold_rate conf t iteration =
         iteration.fold_set.(index) && value mod 2 = 0
     ) t.sampler in
 
+  (* GS. now make a tree... *)
   match Tree.make m 0 sub_set with
     | None ->
       print_endline "converged: no more trees";
       `Converged (iteration.learning_rate, iteration.trees)
 
     | Some tree ->
+      (* GS. the tree computes the best error it can to approximate y.
+         Divide by learning rate for this boosting step. The gamma
+         is this quotient error/learning_rate just for this tree (NOT the
+         sum for the tree list)
+       *)
       let shrunken_tree = Tree.shrink iteration.learning_rate tree in
       let gamma = t.eval (Feat_map.a_find_by_id t.feature_map) shrunken_tree in
 
@@ -198,8 +205,13 @@ and cut_learning_rate conf t iteration =
   } in
   learn_with_fold_rate conf t iteration
 
+(* GS. Entry point when [fold] splits the data into a test set and a
+   training set. The test set is where t.folds.(i)=fold (i.e. the smaller
+   set). Literature: "k-fold cross validation".
+ *)
 let learn_with_fold conf t fold initial_learning_rate deadline =
   let fold_set = Array.init t.n (fun i -> t.folds.(i) <> fold) in
+  (* GS. true => element is in the training set *)
 
   let first_tree = t.splitter#first_tree fold_set in
   reset t first_tree;
@@ -433,6 +445,11 @@ let learn conf =
 
   (* combine the model learned for each fold into a mega-model,
      where these sequence of trees are simply averaged (bagged!) *)
+  (* GS. the list [trees] is the concatenation of the list of trees you
+     get for a single fold. As the approximated value is the sum of the
+     values for each tree, the sum of [trees] is by a factor of num_folds
+     to big on average. So, divide the values in the trees by num_folds.
+   *)
   let trees = loop 0 [] conf.initial_learning_rate in
   let trees =
     let fold_weight = 1.0 /. (float conf.num_folds) in

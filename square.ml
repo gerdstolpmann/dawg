@@ -14,6 +14,14 @@ type model = Model_t.l_regression_model
 let string_of_metrics { n; loss } =
   Printf.sprintf "% 8d %.4e" n loss
 
+(* GS. This function is fake. It doesn't get you the y vector. It gets you
+   the discretized y vector. The main reason is that the real y vector isn't
+   stored in the dog file. Well, this is fixable. I don't see any good reason
+   why the real vector shouldn't be used.
+
+   Technically, the breakpoints are the thresholds where the next discrete
+   value is assumed.
+ *)
 let get_y_as_array y_feature n =
   let y = Array.make n nan in
   let open Dog_t in
@@ -107,16 +115,30 @@ exception EmptyFold
 
 class splitter y_feature n =
   let y = get_y_as_array y_feature n in
+  (* GS. See remark above: this is the vector of discretized y values *)
 
   let z = Array.make n 0.0 in
   let l = Array.make n 0.0 in
   let f = Array.make n 0.0 in
+
+  (* GS.
+     f = cumulated gammas of the previous steps (Friedman: F_(m-1) )
+     z = difference of training and f (Friedman: y~_i = y_i - F_(m-1)(x_i) ),
+         i.e. the value z is what we still need to learn
+     l = loss so far, over all previous steps. Not sure why we need it...
+         l = z ^ 2  (for least squares)
+   *)
 
   let n1 = n + 1 in
 
   let cum_z = Array.make n1 0.0 in
   let cum_l = Array.make n1 0.0 in
   let cum_n = Array.make n1 0 in
+
+  (* GS. Cumulated values of z and l for all values in the current subset.
+     cum_n is increased by 1 for elements in the current subset.
+     See update_cum, which is always called after updating the subset.
+   *)
 
   let in_subset = ref [| |] in
 
@@ -191,6 +213,13 @@ class splitter y_feature n =
       in_subset := [| |]
 
     (* update [f] and [zwl] based on [gamma] *)
+    (* GS. gamma = rho_m * h(x; a_m)
+       in Algorithm 2 of trebst.pdf, i.e. the result of the base learner h
+       for training x and parameters a_m (i.e. the trees), multiplied with the
+       learning rate at this point.
+
+        This function is called after we computed another tree.
+     *)
     method boost gamma : [ `NaN | `Ok ] =
       let last_nan = ref None in
       Array.iteri (

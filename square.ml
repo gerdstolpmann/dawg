@@ -244,10 +244,15 @@ class splitter y_feature n =
         | Some _ -> `NaN
         | None -> `Ok
 
+    (* GS: Called first when we head on to a new subset (from Tree.make) *)
     method update_with_subset in_subset_ =
       in_subset := in_subset_;
       update_cum ()
 
+    (* GS: compute a split for a given feature, and return (loss,split_details).
+       This is called from Tree.best_split_of_features where all remaining
+       features are tried in turn
+     *)
     method best_split
              (monotonicity : Dog_t.monotonicity)
              feature
@@ -277,6 +282,23 @@ class splitter y_feature n =
 
       let left = Aggregate.create cardinality in
       let right = Aggregate.create cardinality in
+
+      (* GS: for the following keep in mind that the loss function is
+         L(y,x) = (y-f(x))^2,
+         and we want to get that
+         SUM(x IN LEFT . (y-f(x)-gamma1)^2) + SUM(x IN RIGHT . (y-f(x)-gamma2)^2)
+         becomes minimal for some gamma1,gamma2 and a split of the set into
+         LEFT and RIGHT, which is the case for
+         gamma1 = mean(x IN LEFT . y-f(x))
+         gamma2 = mean(x IN RIGHT . y-f(x))
+         for given LEFT, RIGHT. The algorithm just tries possible decompositions
+         of the set into LEFT and RIGHT, and computes gamma1, gamma2, and the
+         resulting loss.
+
+         (y: is here the data point to learn, and f the model so far (i.e. all
+         previous boosting steps plus the tree so far already constructed.
+         y-f(x) is the "pseudo response".)
+       *)
 
       match kind with
         | `Cat ->
@@ -341,6 +363,12 @@ class splitter y_feature n =
             right.sum_l.(rk) <- right.sum_l.(rk_1) +. agg.sum_l.(rk);
 
           done;
+
+          (* GS: the following is brain-dead... it simply takes the
+             given sequence of values, and splits it somewhere into two
+             halves so that the loss is minimized. It doesn't take
+             permutations of the sequence into account.
+           *)
 
           let best_split = ref None in
 
